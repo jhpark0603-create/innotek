@@ -1,0 +1,3501 @@
+%% ========================================================================
+% 회전체 가속도 및 두 베어링 합산 반력 통합 FFT·Rainfall 분석
+%
+% Excel 시트 이름:
+%   0.5, 1, 2, 4, 6, 8, ...
+%
+% 목표 회전수:
+%   목표 RPM = 숫자형 시트 이름 × 1e4
+%
+% Excel 열 구성:
+%   A열 : 시간 [s]
+%   B열 : 전역 X축 가속도 [m/s^2]
+%   C열 : 전역 Y축 가속도 [m/s^2]
+%   D열 : 지름 1 mm 위치의 접선 선속도 [m/s]
+%   E열 : 중간+오른쪽 베어링 합산 반력 Fx [N]
+%   F열 : 중간+오른쪽 베어링 합산 반력 Fy [N]
+%   G열 : 중간+오른쪽 베어링 합산 반력 Fz [N]
+%
+% 베어링 조건:
+%   왼쪽 베어링:
+%       radial, tangential, axial 모두 fixed
+%
+%   중간 베어링:
+%       tangential free
+%
+%   오른쪽 끝 베어링:
+%       tangential free
+%
+% 주의:
+%   E:G열은 중간 베어링과 오른쪽 베어링 반력의 합산값입니다.
+%
+%   Fx_sum = Fx_middle + Fx_right
+%   Fy_sum = Fy_middle + Fy_right
+%   Fz_sum = Fz_middle + Fz_right
+%
+%   따라서 개별 베어링의 반력은 계산할 수 없습니다.
+%
+% 출력 Figure:
+%
+%   Figure 1:
+%       모든 RPM의 시간응답을 한 Figure에 행별 배치
+%
+%       열 1: 전역 좌표계 가속도
+%       열 2: 회전체 좌표계 가속도
+%       열 3: 합산반력 전역 성분
+%       열 4: 합산반력 회전체 좌표계
+%
+%   Figure 2:
+%       모든 RPM의 FFT를 동일한 축에 중첩
+%
+%       좌상: 전역 XY 가속도 합성
+%       우상: radial/tangential 가속도
+%       좌하: 전역 XY 합산반력
+%       우하: radial/tangential 합산반력
+%
+%       합산반력 FFT에는 axial 성분을 표시하지 않습니다.
+%
+%   Figure 3:
+%       RPM-주파수 Rainfall plot
+%
+%       좌상: 전역 XY 가속도 합성
+%       우상: radial 가속도
+%       좌하: radial 합산반력
+%       우하: tangential 합산반력
+%
+%       1X, 2X, 3X 차수선을 표시합니다.
+%       자동 검출된 공진 후보는 빨간 점으로 표시합니다.
+%
+%   Figure 4:
+%       RPM별 1X, 2X, 3X 진폭 추이
+%
+%       상: 가속도
+%       중: radial 합산반력
+%       하: tangential 합산반력
+%
+% 공진 후보 판정:
+%
+%   현재 RPM의 고조파 가속도 진폭이 앞뒤 RPM에서 선형 보간한
+%   기준값보다 국부적으로 증폭되는지를 확인합니다.
+%
+%   조건 A:
+%       가속도 증폭비 >= strongAccelerationAmplification
+%
+%   또는 조건 B:
+%       가속도 증폭비 >= minimumAccelerationAmplification
+%       전역 XY 합산반력 증폭비 >= minimumForceAmplification
+%
+%   자동 판정은 최소 3개 RPM 시트가 있어야 가능합니다.
+%
+% 중요:
+%   이 공진 후보 기준은 국제표준의 절대 판정 기준이 아니라,
+%   현재 RPM별 해석 결과를 비교하기 위한 상대적 후보 판정입니다.
+%% ========================================================================
+
+clear;
+clc;
+close all;
+
+
+%% ========================================================================
+% 1. 사용자 설정
+%% ========================================================================
+
+% ------------------------------------------------------------------------
+% 입력 Excel 파일
+% ------------------------------------------------------------------------
+% 직접 입력 예:
+%
+% inputFile = ...
+%     'C:\Users\Administrator\Desktop\과제\FFT\FFT_raw.xlsx';
+%
+% 빈 문자열로 두면 파일 선택창이 열립니다.
+
+inputFile = '';
+
+
+% ------------------------------------------------------------------------
+% 출력 폴더
+% ------------------------------------------------------------------------
+% 직접 입력 예:
+%
+% outputFolder = ...
+%     'C:\Users\Administrator\Desktop\과제\FFT\MATLAB_Result';
+%
+% 빈 문자열로 두면 입력 Excel 파일 옆에 자동 생성됩니다.
+
+outputFolder = '';
+
+
+% ------------------------------------------------------------------------
+% 회전속도 계산 기준
+% ------------------------------------------------------------------------
+% "sheetRPM":
+%   시트 이름에서 계산한 RPM을 회전각과 1X·2X·3X 계산에 사용합니다.
+%
+% "columnD":
+%   D열 선속도를 지름 1 mm 조건으로 환산하여 RPM을 계산합니다.
+%
+% 기존 결과에서 D열 변환 RPM이 거의 0으로 나왔으므로,
+% 기본값은 "sheetRPM"입니다.
+
+rotationSpeedSource = "sheetRPM";
+
+
+% ------------------------------------------------------------------------
+% D열 선속도가 정의된 지름
+% ------------------------------------------------------------------------
+
+rotationDiameter_m = 1.0e-3;      % 1 mm
+rotationRadius_m = rotationDiameter_m / 2;
+
+
+% ------------------------------------------------------------------------
+% 초기 회전각
+% ------------------------------------------------------------------------
+% 회전각 0도에서 다음과 같이 가정합니다.
+%
+%   radial 방향     = 전역 +X
+%   tangential 방향 = 전역 +Y
+
+initialRotationAngle_deg = 0;
+
+
+% ------------------------------------------------------------------------
+% FFT 분석에 사용할 마지막 회전 수
+% ------------------------------------------------------------------------
+
+analysisRevolutions = 30;
+
+
+% 최소 분석 데이터 개수
+
+minimumAnalysisPoints = 256;
+
+
+% ------------------------------------------------------------------------
+% FFT 설정
+% ------------------------------------------------------------------------
+
+maxPlotFrequency_Hz = 10500;
+
+harmonicOrders = [1, 2, 3];
+
+harmonicSearchFraction = 0.03;
+minimumSearchHalfWidth_Hz = 5;
+
+useHannWindow = true;
+useZeroPadding = true;
+
+
+% ------------------------------------------------------------------------
+% 공진 후보 자동 판정 설정
+% ------------------------------------------------------------------------
+%
+% 가속도만 매우 강하게 증폭되는 경우
+
+strongAccelerationAmplification = 2.0;
+
+
+% 가속도와 반력이 함께 증폭되는 경우
+
+minimumAccelerationAmplification = 1.5;
+minimumForceAmplification = 1.3;
+
+
+% 자동 공진 후보 판정 사용 여부
+
+enableAutomaticResonanceDetection = true;
+
+
+% ------------------------------------------------------------------------
+% Rainfall 설정
+% ------------------------------------------------------------------------
+
+rainfallFrequencyPointCount = 2000;
+
+% Rainfall을 정규화 dB 단위로 표시합니다.
+% 각 subplot에서 최대값이 0 dB가 됩니다.
+
+rainfallDBFloor = -60;
+
+
+% ------------------------------------------------------------------------
+% 결과 저장 설정
+% ------------------------------------------------------------------------
+
+saveProcessedTimeHistory = false;
+saveSpectrumData = true;
+
+figureVisibility = 'on';
+
+% Figure를 저장한 뒤 닫을지 설정합니다.
+
+closeFiguresAfterSaving = false;
+
+
+% 통합 Figure 생성 여부
+
+createAllRPMTimeFigure = true;
+createFFTOverlayFigure = true;
+createRainfallFigure = true;
+createHarmonicTrendFigure = true;
+
+
+%% ========================================================================
+% 2. 입력 파일 및 출력 폴더 설정
+%% ========================================================================
+
+if isempty(inputFile) || ~isfile(inputFile)
+
+    [selectedFile, selectedPath] = uigetfile( ...
+        {'*.xlsx;*.xls', 'Excel 파일 (*.xlsx, *.xls)'}, ...
+        '분석할 Excel 파일을 선택하십시오.');
+
+    if isequal(selectedFile, 0)
+        error('파일 선택이 취소되었습니다.');
+    end
+
+    inputFile = fullfile(selectedPath, selectedFile);
+end
+
+
+[inputFolder, inputBaseName, ~] = fileparts(inputFile);
+
+
+if isempty(outputFolder)
+
+    outputFolder = fullfile( ...
+        inputFolder, ...
+        [inputBaseName, '_MATLAB_Result']);
+end
+
+
+if ~exist(outputFolder, 'dir')
+    mkdir(outputFolder);
+end
+
+
+figureFolder = fullfile(outputFolder, 'Figures');
+
+if ~exist(figureFolder, 'dir')
+    mkdir(figureFolder);
+end
+
+
+timeStamp = datestr(now, 'yyyymmdd_HHMMSS');
+
+
+outputExcel = fullfile( ...
+    outputFolder, ...
+    ['Rotor_Analysis_', timeStamp, '.xlsx']);
+
+
+fprintf('\n');
+fprintf('============================================================\n');
+
+fprintf('입력 Excel 파일\n');
+fprintf('%s\n\n', inputFile);
+
+fprintf('회전속도 계산 기준      : %s\n', ...
+    char(rotationSpeedSource));
+
+fprintf('D열 속도 기준 지름      : %.6e m\n', ...
+    rotationDiameter_m);
+
+fprintf('D열 속도 기준 반지름    : %.6e m\n', ...
+    rotationRadius_m);
+
+fprintf('\n출력 폴더\n');
+fprintf('%s\n\n', outputFolder);
+
+fprintf('결과 Excel 파일\n');
+fprintf('%s\n', outputExcel);
+
+fprintf('============================================================\n\n');
+
+
+%% ========================================================================
+% 3. 숫자형 시트 검색
+%% ========================================================================
+
+allSheetNames = sheetnames(inputFile);
+
+numberOfAllSheets = numel(allSheetNames);
+
+sheetFactors = nan(numberOfAllSheets, 1);
+
+
+for iSheet = 1:numberOfAllSheets
+
+    sheetFactors(iSheet) = ...
+        str2double(strtrim(allSheetNames(iSheet)));
+end
+
+
+validSheetMask = ~isnan(sheetFactors);
+
+sheetNames = allSheetNames(validSheetMask);
+sheetFactors = sheetFactors(validSheetMask);
+
+
+if isempty(sheetNames)
+
+    error([ ...
+        '숫자형 시트를 찾지 못했습니다. ', ...
+        '시트 이름을 0.5, 1, 2, 4와 같이 설정하십시오.']);
+end
+
+
+[sheetFactors, sortIndex] = sort(sheetFactors);
+
+sheetNames = sheetNames(sortIndex);
+
+
+fprintf('분석 대상 시트\n');
+
+for iSheet = 1:numel(sheetNames)
+
+    targetRPM = sheetFactors(iSheet) * 1e4;
+
+    fprintf('  시트 %-12s -> %12.3f rpm\n', ...
+        char(sheetNames(iSheet)), ...
+        targetRPM);
+end
+
+fprintf('\n');
+
+
+%% ========================================================================
+% 4. 전체 시트 분석
+%% ========================================================================
+
+summaryRows = struct([]);
+
+analysisResults = struct([]);
+
+
+for iSheet = 1:numel(sheetNames)
+
+    currentSheet = sheetNames(iSheet);
+
+    sheetFactor = sheetFactors(iSheet);
+
+    targetRPM = sheetFactor * 1e4;
+
+
+    fprintf('------------------------------------------------------------\n');
+
+    fprintf('[%d/%d] 시트 "%s" 분석 시작\n', ...
+        iSheet, ...
+        numel(sheetNames), ...
+        char(currentSheet));
+
+    fprintf('목표 회전수: %.3f rpm\n', targetRPM);
+
+
+    %% --------------------------------------------------------------------
+    % 4-1. Excel 데이터 읽기
+    %% --------------------------------------------------------------------
+
+    rawData = readmatrix( ...
+        inputFile, ...
+        'Sheet', char(currentSheet), ...
+        'Range', 'A:G');
+
+
+    if size(rawData, 2) < 7
+
+        warning([ ...
+            '시트 "%s"의 열 개수가 7개보다 적습니다. ', ...
+            '해당 시트를 건너뜁니다.'], ...
+            char(currentSheet));
+
+        continue;
+    end
+
+
+    time_s = rawData(:, 1);
+
+    accelerationX_m_s2 = rawData(:, 2);
+    accelerationY_m_s2 = rawData(:, 3);
+
+    columnDTangentialVelocity_m_s = rawData(:, 4);
+
+    combinedBearingForceX_N = rawData(:, 5);
+    combinedBearingForceY_N = rawData(:, 6);
+    combinedBearingForceZ_N = rawData(:, 7);
+
+
+    %% --------------------------------------------------------------------
+    % 4-2. 유효한 시간 데이터 행만 선택
+    %% --------------------------------------------------------------------
+
+    validTimeMask = isfinite(time_s);
+
+
+    time_s = time_s(validTimeMask);
+
+    accelerationX_m_s2 = ...
+        accelerationX_m_s2(validTimeMask);
+
+    accelerationY_m_s2 = ...
+        accelerationY_m_s2(validTimeMask);
+
+    columnDTangentialVelocity_m_s = ...
+        columnDTangentialVelocity_m_s(validTimeMask);
+
+    combinedBearingForceX_N = ...
+        combinedBearingForceX_N(validTimeMask);
+
+    combinedBearingForceY_N = ...
+        combinedBearingForceY_N(validTimeMask);
+
+    combinedBearingForceZ_N = ...
+        combinedBearingForceZ_N(validTimeMask);
+
+
+    if numel(time_s) < minimumAnalysisPoints
+
+        warning([ ...
+            '시트 "%s"의 유효 데이터가 %d개로 너무 적습니다. ', ...
+            '해당 시트를 건너뜁니다.'], ...
+            char(currentSheet), ...
+            numel(time_s));
+
+        continue;
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-3. 시간 정렬 및 중복 시간 제거
+    %% --------------------------------------------------------------------
+
+    [time_s, timeSortIndex] = sort(time_s);
+
+
+    accelerationX_m_s2 = ...
+        accelerationX_m_s2(timeSortIndex);
+
+    accelerationY_m_s2 = ...
+        accelerationY_m_s2(timeSortIndex);
+
+    columnDTangentialVelocity_m_s = ...
+        columnDTangentialVelocity_m_s(timeSortIndex);
+
+    combinedBearingForceX_N = ...
+        combinedBearingForceX_N(timeSortIndex);
+
+    combinedBearingForceY_N = ...
+        combinedBearingForceY_N(timeSortIndex);
+
+    combinedBearingForceZ_N = ...
+        combinedBearingForceZ_N(timeSortIndex);
+
+
+    [time_s, uniqueTimeIndex] = unique(time_s, 'stable');
+
+
+    accelerationX_m_s2 = ...
+        accelerationX_m_s2(uniqueTimeIndex);
+
+    accelerationY_m_s2 = ...
+        accelerationY_m_s2(uniqueTimeIndex);
+
+    columnDTangentialVelocity_m_s = ...
+        columnDTangentialVelocity_m_s(uniqueTimeIndex);
+
+    combinedBearingForceX_N = ...
+        combinedBearingForceX_N(uniqueTimeIndex);
+
+    combinedBearingForceY_N = ...
+        combinedBearingForceY_N(uniqueTimeIndex);
+
+    combinedBearingForceZ_N = ...
+        combinedBearingForceZ_N(uniqueTimeIndex);
+
+
+    %% --------------------------------------------------------------------
+    % 4-4. NaN 및 Inf 처리
+    %% --------------------------------------------------------------------
+
+    accelerationX_m_s2 = fillInvalidData( ...
+        accelerationX_m_s2, ...
+        'X축 가속도');
+
+    accelerationY_m_s2 = fillInvalidData( ...
+        accelerationY_m_s2, ...
+        'Y축 가속도');
+
+    columnDTangentialVelocity_m_s = fillInvalidData( ...
+        columnDTangentialVelocity_m_s, ...
+        'D열 접선 선속도');
+
+    combinedBearingForceX_N = fillInvalidData( ...
+        combinedBearingForceX_N, ...
+        '두 베어링 합산 Fx');
+
+    combinedBearingForceY_N = fillInvalidData( ...
+        combinedBearingForceY_N, ...
+        '두 베어링 합산 Fy');
+
+    combinedBearingForceZ_N = fillInvalidData( ...
+        combinedBearingForceZ_N, ...
+        '두 베어링 합산 Fz');
+
+
+    if any(diff(time_s) <= 0)
+
+        error( ...
+            '시트 "%s"의 시간 데이터가 단조 증가하지 않습니다.', ...
+            char(currentSheet));
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-5. 목표 회전속도와 예상 접선 선속도
+    %% --------------------------------------------------------------------
+
+    targetAngularVelocity_rad_s = ...
+        targetRPM * 2*pi / 60;
+
+
+    expectedTangentialVelocity_m_s = ...
+        targetAngularVelocity_rad_s * rotationRadius_m;
+
+
+    %% --------------------------------------------------------------------
+    % 4-6. D열 선속도를 각속도와 RPM으로 변환
+    %% --------------------------------------------------------------------
+
+    columnDConvertedAngularVelocity_rad_s = ...
+        columnDTangentialVelocity_m_s / rotationRadius_m;
+
+
+    columnDConvertedRPM = ...
+        columnDConvertedAngularVelocity_rad_s * 60 / (2*pi);
+
+
+    %% --------------------------------------------------------------------
+    % 4-7. 실제 분석에 사용할 회전속도 설정
+    %% --------------------------------------------------------------------
+
+    switch lower(string(rotationSpeedSource))
+
+        case "sheetrpm"
+
+            usedAngularVelocity_rad_s = ...
+                targetAngularVelocity_rad_s * ones(size(time_s));
+
+
+            usedRPM = ...
+                targetRPM * ones(size(time_s));
+
+
+        case "columnd"
+
+            usedAngularVelocity_rad_s = ...
+                columnDConvertedAngularVelocity_rad_s;
+
+
+            usedRPM = ...
+                columnDConvertedRPM;
+
+
+        otherwise
+
+            error([ ...
+                'rotationSpeedSource는 "sheetRPM" 또는 ', ...
+                '"columnD"이어야 합니다.']);
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-8. 회전각과 누적 회전 수 계산
+    %% --------------------------------------------------------------------
+
+    initialRotationAngle_rad = ...
+        deg2rad(initialRotationAngle_deg);
+
+
+    rotationAngle_rad = ...
+        initialRotationAngle_rad + ...
+        cumtrapz(time_s, usedAngularVelocity_rad_s);
+
+
+    cumulativeRevolutions = ...
+        cumtrapz( ...
+        time_s, ...
+        abs(usedAngularVelocity_rad_s)) / (2*pi);
+
+
+    totalRevolutions = cumulativeRevolutions(end);
+
+
+    %% --------------------------------------------------------------------
+    % 4-9. 마지막 지정 회전 수의 분석 구간 선택
+    %% --------------------------------------------------------------------
+
+    if totalRevolutions > analysisRevolutions
+
+        analysisStartRevolution = ...
+            totalRevolutions - analysisRevolutions;
+
+
+        analysisMask = ...
+            cumulativeRevolutions >= analysisStartRevolution;
+
+    else
+
+        analysisMask = true(size(time_s));
+
+
+        warning([ ...
+            '시트 "%s"의 전체 회전 수가 %.3f회로, ', ...
+            '설정한 %.3f회보다 적습니다. 전체 구간을 사용합니다.'], ...
+            char(currentSheet), ...
+            totalRevolutions, ...
+            analysisRevolutions);
+    end
+
+
+    if nnz(analysisMask) < minimumAnalysisPoints
+
+        startIndex = max( ...
+            1, ...
+            numel(time_s) - minimumAnalysisPoints + 1);
+
+
+        analysisMask = false(size(time_s));
+
+        analysisMask(startIndex:end) = true;
+    end
+
+
+    analysisTimeRaw_s = time_s(analysisMask);
+
+
+    if numel(analysisTimeRaw_s) < 2
+
+        warning( ...
+            '시트 "%s"의 분석 데이터가 부족합니다.', ...
+            char(currentSheet));
+
+        continue;
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-10. 균일 시간축 생성
+    %% --------------------------------------------------------------------
+
+    measuredTimeStep_s = ...
+        median(diff(analysisTimeRaw_s));
+
+
+    if ~isfinite(measuredTimeStep_s) || ...
+            measuredTimeStep_s <= 0
+
+        warning( ...
+            '시트 "%s"의 시간 간격이 올바르지 않습니다.', ...
+            char(currentSheet));
+
+        continue;
+    end
+
+
+    uniformTime_s = ...
+        ( ...
+        analysisTimeRaw_s(1): ...
+        measuredTimeStep_s: ...
+        analysisTimeRaw_s(end) ...
+        ).';
+
+
+    if numel(uniformTime_s) < minimumAnalysisPoints
+
+        warning([ ...
+            '시트 "%s"의 균일 보간 데이터가 %d개로 너무 적습니다.'], ...
+            char(currentSheet), ...
+            numel(uniformTime_s));
+
+        continue;
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-11. 모든 신호를 균일 시간축으로 보간
+    %% --------------------------------------------------------------------
+
+    columnDTangentialVelocityUniform_m_s = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        columnDTangentialVelocity_m_s(analysisMask), ...
+        uniformTime_s);
+
+
+    columnDConvertedRPMUniform = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        columnDConvertedRPM(analysisMask), ...
+        uniformTime_s);
+
+
+    usedAngularVelocityUniform_rad_s = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        usedAngularVelocity_rad_s(analysisMask), ...
+        uniformTime_s);
+
+
+    usedRPMUniform = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        usedRPM(analysisMask), ...
+        uniformTime_s);
+
+
+    rotationAngleUniform_rad = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        rotationAngle_rad(analysisMask), ...
+        uniformTime_s);
+
+
+    accelerationXUniform_m_s2 = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        accelerationX_m_s2(analysisMask), ...
+        uniformTime_s);
+
+
+    accelerationYUniform_m_s2 = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        accelerationY_m_s2(analysisMask), ...
+        uniformTime_s);
+
+
+    combinedBearingForceXUniform_N = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        combinedBearingForceX_N(analysisMask), ...
+        uniformTime_s);
+
+
+    combinedBearingForceYUniform_N = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        combinedBearingForceY_N(analysisMask), ...
+        uniformTime_s);
+
+
+    combinedBearingForceZUniform_N = interpolateSignal( ...
+        analysisTimeRaw_s, ...
+        combinedBearingForceZ_N(analysisMask), ...
+        uniformTime_s);
+
+
+    %% --------------------------------------------------------------------
+    % 4-12. 회전체 radial-tangential 좌표 변환
+    %% --------------------------------------------------------------------
+
+    cosThetaUniform = cos(rotationAngleUniform_rad);
+    sinThetaUniform = sin(rotationAngleUniform_rad);
+
+
+    accelerationRadialUniform_m_s2 = ...
+        accelerationXUniform_m_s2 .* cosThetaUniform + ...
+        accelerationYUniform_m_s2 .* sinThetaUniform;
+
+
+    accelerationTangentialUniform_m_s2 = ...
+       -accelerationXUniform_m_s2 .* sinThetaUniform + ...
+        accelerationYUniform_m_s2 .* cosThetaUniform;
+
+
+    accelerationXYMagnitudeUniform_m_s2 = ...
+        sqrt( ...
+        accelerationXUniform_m_s2.^2 + ...
+        accelerationYUniform_m_s2.^2);
+
+
+    combinedBearingForceRadialUniform_N = ...
+        combinedBearingForceXUniform_N .* cosThetaUniform + ...
+        combinedBearingForceYUniform_N .* sinThetaUniform;
+
+
+    combinedBearingForceTangentialUniform_N = ...
+       -combinedBearingForceXUniform_N .* sinThetaUniform + ...
+        combinedBearingForceYUniform_N .* cosThetaUniform;
+
+
+    combinedBearingForceAxialUniform_N = ...
+        combinedBearingForceZUniform_N;
+
+
+    combinedBearingForceXYMagnitudeUniform_N = ...
+        sqrt( ...
+        combinedBearingForceXUniform_N.^2 + ...
+        combinedBearingForceYUniform_N.^2);
+
+
+    combinedBearingForceXYZMagnitudeUniform_N = ...
+        sqrt( ...
+        combinedBearingForceXUniform_N.^2 + ...
+        combinedBearingForceYUniform_N.^2 + ...
+        combinedBearingForceZUniform_N.^2);
+
+
+    %% --------------------------------------------------------------------
+    % 4-13. 상대 회전 수 계산
+    %
+    % 서로 다른 RPM의 시간응답을 비교하기 쉽도록,
+    % Figure 1의 X축은 시간이 아니라 상대 회전 수를 사용합니다.
+    %% --------------------------------------------------------------------
+
+    relativeRevolutionUniform = ...
+        cumtrapz( ...
+        uniformTime_s, ...
+        abs(usedAngularVelocityUniform_rad_s)) / (2*pi);
+
+
+    relativeRevolutionUniform = ...
+        relativeRevolutionUniform - relativeRevolutionUniform(1);
+
+
+    %% --------------------------------------------------------------------
+    % 4-14. 샘플링 및 회전속도 정보
+    %% --------------------------------------------------------------------
+
+    samplingFrequency_Hz = ...
+        1 / measuredTimeStep_s;
+
+
+    nyquistFrequency_Hz = ...
+        samplingFrequency_Hz / 2;
+
+
+    numberOfAnalysisSamples = ...
+        numel(uniformTime_s);
+
+
+    analysisDuration_s = ...
+        uniformTime_s(end) - uniformTime_s(1);
+
+
+    actualFrequencyResolution_Hz = ...
+        samplingFrequency_Hz / numberOfAnalysisSamples;
+
+
+    meanUsedAngularVelocity_rad_s = ...
+        mean(usedAngularVelocityUniform_rad_s);
+
+
+    meanAbsoluteUsedAngularVelocity_rad_s = ...
+        mean(abs(usedAngularVelocityUniform_rad_s));
+
+
+    meanUsedRPM = ...
+        mean(usedRPMUniform);
+
+
+    meanAbsoluteUsedRPM = ...
+        mean(abs(usedRPMUniform));
+
+
+    usedRotationFrequency_Hz = ...
+        meanAbsoluteUsedRPM / 60;
+
+
+    meanColumnDVelocity_m_s = ...
+        mean(columnDTangentialVelocityUniform_m_s);
+
+
+    meanAbsoluteColumnDVelocity_m_s = ...
+        mean(abs(columnDTangentialVelocityUniform_m_s));
+
+
+    meanAbsoluteColumnDConvertedRPM = ...
+        mean(abs(columnDConvertedRPMUniform));
+
+
+    if expectedTangentialVelocity_m_s ~= 0
+
+        columnDVelocityErrorPercent = ...
+            100 * ...
+            ( ...
+            meanAbsoluteColumnDVelocity_m_s - ...
+            abs(expectedTangentialVelocity_m_s) ...
+            ) / ...
+            abs(expectedTangentialVelocity_m_s);
+
+    else
+
+        columnDVelocityErrorPercent = NaN;
+    end
+
+
+    fprintf('목표 접선 선속도         : %.9f m/s\n', ...
+        expectedTangentialVelocity_m_s);
+
+    fprintf('D열 평균 절대 선속도     : %.9e m/s\n', ...
+        meanAbsoluteColumnDVelocity_m_s);
+
+    fprintf('D열 변환 평균 절대 RPM   : %.6f rpm\n', ...
+        meanAbsoluteColumnDConvertedRPM);
+
+    fprintf('분석에 사용한 평균 RPM   : %.6f rpm\n', ...
+        meanAbsoluteUsedRPM);
+
+    fprintf('분석에 사용한 평균 각속도: %.6f rad/s\n', ...
+        meanAbsoluteUsedAngularVelocity_rad_s);
+
+    fprintf('Sampling frequency       : %.6f Hz\n', ...
+        samplingFrequency_Hz);
+
+    fprintf('Nyquist frequency        : %.6f Hz\n', ...
+        nyquistFrequency_Hz);
+
+    fprintf('실제 주파수 분해능        : %.6f Hz\n', ...
+        actualFrequencyResolution_Hz);
+
+    fprintf('FFT 분석 데이터 수       : %d\n', ...
+        numberOfAnalysisSamples);
+
+
+    if isfinite(columnDVelocityErrorPercent) && ...
+            abs(columnDVelocityErrorPercent) > 5
+
+        warning([ ...
+            '시트 "%s": D열 평균 절대 선속도가 목표 접선 선속도와 ', ...
+            '%.3f%% 차이 납니다. 현재 회전각과 차수 계산에는 ', ...
+            '%s 기준을 사용합니다.'], ...
+            char(currentSheet), ...
+            columnDVelocityErrorPercent, ...
+            char(rotationSpeedSource));
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-15. 가속도 FFT
+    %% --------------------------------------------------------------------
+
+    [frequency_Hz, accelerationXAmplitude_m_s2, fftLength] = ...
+        singleSidedFFT( ...
+        accelerationXUniform_m_s2, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    [~, accelerationYAmplitude_m_s2] = ...
+        singleSidedFFT( ...
+        accelerationYUniform_m_s2, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    [~, accelerationRadialAmplitude_m_s2] = ...
+        singleSidedFFT( ...
+        accelerationRadialUniform_m_s2, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    [~, accelerationTangentialAmplitude_m_s2] = ...
+        singleSidedFFT( ...
+        accelerationTangentialUniform_m_s2, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    accelerationXYCombinedAmplitude_m_s2 = ...
+        sqrt( ...
+        accelerationXAmplitude_m_s2.^2 + ...
+        accelerationYAmplitude_m_s2.^2);
+
+
+    accelerationRotatingCombinedAmplitude_m_s2 = ...
+        sqrt( ...
+        accelerationRadialAmplitude_m_s2.^2 + ...
+        accelerationTangentialAmplitude_m_s2.^2);
+
+
+    %% --------------------------------------------------------------------
+    % 4-16. 두 베어링 합산반력 FFT
+    %% --------------------------------------------------------------------
+
+    [~, combinedBearingForceXAmplitude_N] = ...
+        singleSidedFFT( ...
+        combinedBearingForceXUniform_N, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    [~, combinedBearingForceYAmplitude_N] = ...
+        singleSidedFFT( ...
+        combinedBearingForceYUniform_N, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    [~, combinedBearingForceZAmplitude_N] = ...
+        singleSidedFFT( ...
+        combinedBearingForceZUniform_N, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    [~, combinedBearingForceRadialAmplitude_N] = ...
+        singleSidedFFT( ...
+        combinedBearingForceRadialUniform_N, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    [~, combinedBearingForceTangentialAmplitude_N] = ...
+        singleSidedFFT( ...
+        combinedBearingForceTangentialUniform_N, ...
+        samplingFrequency_Hz, ...
+        useHannWindow, ...
+        useZeroPadding);
+
+
+    combinedBearingForceXYCombinedAmplitude_N = ...
+        sqrt( ...
+        combinedBearingForceXAmplitude_N.^2 + ...
+        combinedBearingForceYAmplitude_N.^2);
+
+
+    combinedBearingForceXYZCombinedAmplitude_N = ...
+        sqrt( ...
+        combinedBearingForceXAmplitude_N.^2 + ...
+        combinedBearingForceYAmplitude_N.^2 + ...
+        combinedBearingForceZAmplitude_N.^2);
+
+
+    combinedBearingForceRotatingCombinedAmplitude_N = ...
+        sqrt( ...
+        combinedBearingForceRadialAmplitude_N.^2 + ...
+        combinedBearingForceTangentialAmplitude_N.^2);
+
+
+    fftBinSpacing_Hz = ...
+        samplingFrequency_Hz / fftLength;
+
+
+    %% --------------------------------------------------------------------
+    % 4-17. Summary 기본 정보
+    %% --------------------------------------------------------------------
+
+    summaryRow = struct();
+
+
+    summaryRow.Sheet = ...
+        string(currentSheet);
+
+
+    summaryRow.TargetRPM = ...
+        targetRPM;
+
+
+    summaryRow.RotationSpeedSource = ...
+        string(rotationSpeedSource);
+
+
+    summaryRow.RotationDiameter_m = ...
+        rotationDiameter_m;
+
+
+    summaryRow.RotationRadius_m = ...
+        rotationRadius_m;
+
+
+    summaryRow.ExpectedTangentialVelocity_m_s = ...
+        expectedTangentialVelocity_m_s;
+
+
+    summaryRow.ColumnDMeanTangentialVelocity_m_s = ...
+        meanColumnDVelocity_m_s;
+
+
+    summaryRow.ColumnDMeanAbsoluteTangentialVelocity_m_s = ...
+        meanAbsoluteColumnDVelocity_m_s;
+
+
+    summaryRow.ColumnDConvertedMeanAbsoluteRPM = ...
+        meanAbsoluteColumnDConvertedRPM;
+
+
+    summaryRow.ColumnDVelocityErrorPercent = ...
+        columnDVelocityErrorPercent;
+
+
+    summaryRow.UsedMeanAngularVelocity_rad_s = ...
+        meanUsedAngularVelocity_rad_s;
+
+
+    summaryRow.UsedMeanAbsoluteAngularVelocity_rad_s = ...
+        meanAbsoluteUsedAngularVelocity_rad_s;
+
+
+    summaryRow.UsedMeanRPM = ...
+        meanUsedRPM;
+
+
+    summaryRow.UsedMeanAbsoluteRPM = ...
+        meanAbsoluteUsedRPM;
+
+
+    summaryRow.RotationFrequency_Hz = ...
+        usedRotationFrequency_Hz;
+
+
+    summaryRow.AnalysisStartTime_s = ...
+        uniformTime_s(1);
+
+
+    summaryRow.AnalysisEndTime_s = ...
+        uniformTime_s(end);
+
+
+    summaryRow.AnalysisDuration_s = ...
+        analysisDuration_s;
+
+
+    summaryRow.TotalRevolutions = ...
+        totalRevolutions;
+
+
+    summaryRow.AnalysisRevolutionsUsed = ...
+        relativeRevolutionUniform(end);
+
+
+    summaryRow.NumberOfSamples = ...
+        numberOfAnalysisSamples;
+
+
+    summaryRow.TimeStep_s = ...
+        measuredTimeStep_s;
+
+
+    summaryRow.SamplingFrequency_Hz = ...
+        samplingFrequency_Hz;
+
+
+    summaryRow.NyquistFrequency_Hz = ...
+        nyquistFrequency_Hz;
+
+
+    summaryRow.ActualFrequencyResolution_Hz = ...
+        actualFrequencyResolution_Hz;
+
+
+    summaryRow.FFTBinSpacing_Hz = ...
+        fftBinSpacing_Hz;
+
+
+    %% --------------------------------------------------------------------
+    % 4-18. 시간응답 최대값 저장
+    %% --------------------------------------------------------------------
+
+    summaryRow.AccelerationXPeakAbsolute_m_s2 = ...
+        max(abs(accelerationXUniform_m_s2));
+
+
+    summaryRow.AccelerationYPeakAbsolute_m_s2 = ...
+        max(abs(accelerationYUniform_m_s2));
+
+
+    summaryRow.AccelerationRadialPeakAbsolute_m_s2 = ...
+        max(abs(accelerationRadialUniform_m_s2));
+
+
+    summaryRow.AccelerationTangentialPeakAbsolute_m_s2 = ...
+        max(abs(accelerationTangentialUniform_m_s2));
+
+
+    summaryRow.AccelerationXYMagnitudePeak_m_s2 = ...
+        max(accelerationXYMagnitudeUniform_m_s2);
+
+
+    summaryRow.CombinedBearingForceXPeakAbsolute_N = ...
+        max(abs(combinedBearingForceXUniform_N));
+
+
+    summaryRow.CombinedBearingForceYPeakAbsolute_N = ...
+        max(abs(combinedBearingForceYUniform_N));
+
+
+    summaryRow.CombinedBearingForceZPeakAbsolute_N = ...
+        max(abs(combinedBearingForceZUniform_N));
+
+
+    summaryRow.CombinedBearingRadialPeakAbsolute_N = ...
+        max(abs(combinedBearingForceRadialUniform_N));
+
+
+    summaryRow.CombinedBearingTangentialPeakAbsolute_N = ...
+        max(abs(combinedBearingForceTangentialUniform_N));
+
+
+    summaryRow.CombinedBearingXYMagnitudePeak_N = ...
+        max(combinedBearingForceXYMagnitudeUniform_N);
+
+
+    summaryRow.CombinedBearingXYZMagnitudePeak_N = ...
+        max(combinedBearingForceXYZMagnitudeUniform_N);
+
+
+    %% --------------------------------------------------------------------
+    % 4-19. 1X, 2X, 3X 성분 추출
+    %% --------------------------------------------------------------------
+
+    for iOrder = 1:numel(harmonicOrders)
+
+        currentOrder = harmonicOrders(iOrder);
+
+
+        expectedFrequency_Hz = ...
+            currentOrder * usedRotationFrequency_Hz;
+
+
+        searchHalfWidth_Hz = max( ...
+            expectedFrequency_Hz * harmonicSearchFraction, ...
+            minimumSearchHalfWidth_Hz);
+
+
+        % 전역 XY 가속도 합성
+
+        [accelerationPeakFrequency_Hz, ...
+         accelerationPeakAmplitude_m_s2] = ...
+            findPeakNearFrequency( ...
+            frequency_Hz, ...
+            accelerationXYCombinedAmplitude_m_s2, ...
+            expectedFrequency_Hz, ...
+            searchHalfWidth_Hz);
+
+
+        % 전역 XY 합산반력
+
+        [globalXYForcePeakFrequency_Hz, ...
+         globalXYForcePeakAmplitude_N] = ...
+            findPeakNearFrequency( ...
+            frequency_Hz, ...
+            combinedBearingForceXYCombinedAmplitude_N, ...
+            expectedFrequency_Hz, ...
+            searchHalfWidth_Hz);
+
+
+        % Radial 합산반력
+
+        [radialForcePeakFrequency_Hz, ...
+         radialForcePeakAmplitude_N] = ...
+            findPeakNearFrequency( ...
+            frequency_Hz, ...
+            combinedBearingForceRadialAmplitude_N, ...
+            expectedFrequency_Hz, ...
+            searchHalfWidth_Hz);
+
+
+        % Tangential 합산반력
+
+        [tangentialForcePeakFrequency_Hz, ...
+         tangentialForcePeakAmplitude_N] = ...
+            findPeakNearFrequency( ...
+            frequency_Hz, ...
+            combinedBearingForceTangentialAmplitude_N, ...
+            expectedFrequency_Hz, ...
+            searchHalfWidth_Hz);
+
+
+        orderText = sprintf('%dX', currentOrder);
+
+
+        % MATLAB 필드명은 숫자로 시작할 수 없으므로,
+        % Harmonic_1X 형식으로 저장합니다.
+
+        summaryRow.(sprintf( ...
+            'Harmonic_%s_ExpectedFrequency_Hz', ...
+            orderText)) = ...
+            expectedFrequency_Hz;
+
+
+        summaryRow.(sprintf( ...
+            'AccelerationXY_%s_PeakFrequency_Hz', ...
+            orderText)) = ...
+            accelerationPeakFrequency_Hz;
+
+
+        summaryRow.(sprintf( ...
+            'AccelerationXY_%s_Amplitude_m_s2', ...
+            orderText)) = ...
+            accelerationPeakAmplitude_m_s2;
+
+
+        summaryRow.(sprintf( ...
+            'CombinedGlobalXYForce_%s_PeakFrequency_Hz', ...
+            orderText)) = ...
+            globalXYForcePeakFrequency_Hz;
+
+
+        summaryRow.(sprintf( ...
+            'CombinedGlobalXYForce_%s_Amplitude_N', ...
+            orderText)) = ...
+            globalXYForcePeakAmplitude_N;
+
+
+        summaryRow.(sprintf( ...
+            'CombinedRadialForce_%s_PeakFrequency_Hz', ...
+            orderText)) = ...
+            radialForcePeakFrequency_Hz;
+
+
+        summaryRow.(sprintf( ...
+            'CombinedRadialForce_%s_Amplitude_N', ...
+            orderText)) = ...
+            radialForcePeakAmplitude_N;
+
+
+        summaryRow.(sprintf( ...
+            'CombinedTangentialForce_%s_PeakFrequency_Hz', ...
+            orderText)) = ...
+            tangentialForcePeakFrequency_Hz;
+
+
+        summaryRow.(sprintf( ...
+            'CombinedTangentialForce_%s_Amplitude_N', ...
+            orderText)) = ...
+            tangentialForcePeakAmplitude_N;
+    end
+
+
+    if isempty(summaryRows)
+
+        summaryRows = summaryRow;
+
+    else
+
+        summaryRows(end+1) = summaryRow;
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-20. 분석 결과 배열에 저장
+    %% --------------------------------------------------------------------
+
+    result = struct();
+
+
+    result.Sheet = string(currentSheet);
+    result.TargetRPM = targetRPM;
+
+    result.RelativeRevolution = relativeRevolutionUniform;
+    result.UniformTime_s = uniformTime_s;
+
+
+    result.AccelerationX_m_s2 = ...
+        accelerationXUniform_m_s2;
+
+    result.AccelerationY_m_s2 = ...
+        accelerationYUniform_m_s2;
+
+    result.AccelerationXYMagnitude_m_s2 = ...
+        accelerationXYMagnitudeUniform_m_s2;
+
+    result.AccelerationRadial_m_s2 = ...
+        accelerationRadialUniform_m_s2;
+
+    result.AccelerationTangential_m_s2 = ...
+        accelerationTangentialUniform_m_s2;
+
+
+    result.CombinedForceX_N = ...
+        combinedBearingForceXUniform_N;
+
+    result.CombinedForceY_N = ...
+        combinedBearingForceYUniform_N;
+
+    result.CombinedForceZ_N = ...
+        combinedBearingForceZUniform_N;
+
+    result.CombinedForceRadial_N = ...
+        combinedBearingForceRadialUniform_N;
+
+    result.CombinedForceTangential_N = ...
+        combinedBearingForceTangentialUniform_N;
+
+    result.CombinedForceAxial_N = ...
+        combinedBearingForceAxialUniform_N;
+
+
+    result.Frequency_Hz = frequency_Hz;
+
+    result.NyquistFrequency_Hz = nyquistFrequency_Hz;
+
+
+    result.AccelerationXAmplitude_m_s2 = ...
+        accelerationXAmplitude_m_s2;
+
+    result.AccelerationYAmplitude_m_s2 = ...
+        accelerationYAmplitude_m_s2;
+
+    result.AccelerationXYCombinedAmplitude_m_s2 = ...
+        accelerationXYCombinedAmplitude_m_s2;
+
+    result.AccelerationRadialAmplitude_m_s2 = ...
+        accelerationRadialAmplitude_m_s2;
+
+    result.AccelerationTangentialAmplitude_m_s2 = ...
+        accelerationTangentialAmplitude_m_s2;
+
+    result.AccelerationRotatingCombinedAmplitude_m_s2 = ...
+        accelerationRotatingCombinedAmplitude_m_s2;
+
+
+    result.CombinedForceXAmplitude_N = ...
+        combinedBearingForceXAmplitude_N;
+
+    result.CombinedForceYAmplitude_N = ...
+        combinedBearingForceYAmplitude_N;
+
+    result.CombinedForceZAmplitude_N = ...
+        combinedBearingForceZAmplitude_N;
+
+    result.CombinedForceXYCombinedAmplitude_N = ...
+        combinedBearingForceXYCombinedAmplitude_N;
+
+    result.CombinedForceXYZCombinedAmplitude_N = ...
+        combinedBearingForceXYZCombinedAmplitude_N;
+
+    result.CombinedForceRadialAmplitude_N = ...
+        combinedBearingForceRadialAmplitude_N;
+
+    result.CombinedForceTangentialAmplitude_N = ...
+        combinedBearingForceTangentialAmplitude_N;
+
+    result.CombinedForceRotatingCombinedAmplitude_N = ...
+        combinedBearingForceRotatingCombinedAmplitude_N;
+
+
+    if isempty(analysisResults)
+
+        analysisResults = result;
+
+    else
+
+        analysisResults(end+1) = result;
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-21. Excel 출력용 시트 이름
+    %% --------------------------------------------------------------------
+
+    safeSheetText = regexprep( ...
+        char(currentSheet), ...
+        '[^a-zA-Z0-9]', ...
+        '_');
+
+
+    %% --------------------------------------------------------------------
+    % 4-22. 보간된 시간응답 저장
+    %% --------------------------------------------------------------------
+
+    if saveProcessedTimeHistory
+
+        processedTimeTable = table( ...
+            uniformTime_s, ...
+            relativeRevolutionUniform, ...
+            columnDTangentialVelocityUniform_m_s, ...
+            columnDConvertedRPMUniform, ...
+            usedRPMUniform, ...
+            rad2deg(rotationAngleUniform_rad), ...
+            accelerationXUniform_m_s2, ...
+            accelerationYUniform_m_s2, ...
+            accelerationRadialUniform_m_s2, ...
+            accelerationTangentialUniform_m_s2, ...
+            accelerationXYMagnitudeUniform_m_s2, ...
+            combinedBearingForceXUniform_N, ...
+            combinedBearingForceYUniform_N, ...
+            combinedBearingForceZUniform_N, ...
+            combinedBearingForceRadialUniform_N, ...
+            combinedBearingForceTangentialUniform_N, ...
+            combinedBearingForceAxialUniform_N, ...
+            combinedBearingForceXYMagnitudeUniform_N, ...
+            combinedBearingForceXYZMagnitudeUniform_N, ...
+            'VariableNames', { ...
+            'Time_s', ...
+            'RelativeRevolution', ...
+            'ColumnD_TangentialVelocity_m_s', ...
+            'ColumnD_ConvertedRPM', ...
+            'UsedRPM', ...
+            'RotationAngle_deg', ...
+            'AccelerationX_m_s2', ...
+            'AccelerationY_m_s2', ...
+            'AccelerationRadial_m_s2', ...
+            'AccelerationTangential_m_s2', ...
+            'AccelerationXYMagnitude_m_s2', ...
+            'CombinedBearingForceX_N', ...
+            'CombinedBearingForceY_N', ...
+            'CombinedBearingForceZ_N', ...
+            'CombinedBearingForceRadial_N', ...
+            'CombinedBearingForceTangential_N', ...
+            'CombinedBearingForceAxial_N', ...
+            'CombinedBearingForceXYMagnitude_N', ...
+            'CombinedBearingForceXYZMagnitude_N'});
+
+
+        outputTimeSheet = makeExcelSheetName( ...
+            'Time_', ...
+            safeSheetText);
+
+
+        writetable( ...
+            processedTimeTable, ...
+            outputExcel, ...
+            'Sheet', outputTimeSheet);
+    end
+
+
+    %% --------------------------------------------------------------------
+    % 4-23. FFT 데이터 저장
+    %% --------------------------------------------------------------------
+
+    if saveSpectrumData
+
+        spectrumTable = table( ...
+            frequency_Hz, ...
+            accelerationXAmplitude_m_s2, ...
+            accelerationYAmplitude_m_s2, ...
+            accelerationXYCombinedAmplitude_m_s2, ...
+            accelerationRadialAmplitude_m_s2, ...
+            accelerationTangentialAmplitude_m_s2, ...
+            accelerationRotatingCombinedAmplitude_m_s2, ...
+            combinedBearingForceXAmplitude_N, ...
+            combinedBearingForceYAmplitude_N, ...
+            combinedBearingForceZAmplitude_N, ...
+            combinedBearingForceXYCombinedAmplitude_N, ...
+            combinedBearingForceXYZCombinedAmplitude_N, ...
+            combinedBearingForceRadialAmplitude_N, ...
+            combinedBearingForceTangentialAmplitude_N, ...
+            combinedBearingForceRotatingCombinedAmplitude_N, ...
+            'VariableNames', { ...
+            'Frequency_Hz', ...
+            'AccelerationX_Amplitude_m_s2', ...
+            'AccelerationY_Amplitude_m_s2', ...
+            'AccelerationXY_CombinedAmplitude_m_s2', ...
+            'AccelerationRadial_Amplitude_m_s2', ...
+            'AccelerationTangential_Amplitude_m_s2', ...
+            'AccelerationRotating_CombinedAmplitude_m_s2', ...
+            'CombinedBearingForceX_Amplitude_N', ...
+            'CombinedBearingForceY_Amplitude_N', ...
+            'CombinedBearingForceZ_Amplitude_N', ...
+            'CombinedBearingForceXY_CombinedAmplitude_N', ...
+            'CombinedBearingForceXYZ_CombinedAmplitude_N', ...
+            'CombinedBearingForceRadial_Amplitude_N', ...
+            'CombinedBearingForceTangential_Amplitude_N', ...
+            'CombinedBearingForceRotating_CombinedAmplitude_N'});
+
+
+        outputFFTSheet = makeExcelSheetName( ...
+            'FFT_', ...
+            safeSheetText);
+
+
+        writetable( ...
+            spectrumTable, ...
+            outputExcel, ...
+            'Sheet', outputFFTSheet);
+    end
+
+
+    fprintf('시트 "%s" 분석 완료\n\n', ...
+        char(currentSheet));
+
+end
+
+
+%% ========================================================================
+% 5. Summary 저장
+%% ========================================================================
+
+if isempty(summaryRows) || isempty(analysisResults)
+
+    error('분석에 성공한 숫자형 시트가 없습니다.');
+end
+
+
+summaryTable = struct2table(summaryRows);
+
+
+summaryTable = sortrows( ...
+    summaryTable, ...
+    'TargetRPM');
+
+
+writetable( ...
+    summaryTable, ...
+    outputExcel, ...
+    'Sheet', 'Summary');
+
+
+%% ========================================================================
+% 6. 공진 후보 자동 판정
+%% ========================================================================
+
+if enableAutomaticResonanceDetection
+
+    resonanceCandidateTable = findResonanceCandidates( ...
+        summaryTable, ...
+        harmonicOrders, ...
+        minimumAccelerationAmplification, ...
+        minimumForceAmplification, ...
+        strongAccelerationAmplification);
+
+else
+
+    resonanceCandidateTable = createEmptyCandidateTable();
+end
+
+
+if ~isempty(resonanceCandidateTable)
+
+    writetable( ...
+        resonanceCandidateTable, ...
+        outputExcel, ...
+        'Sheet', 'ResonanceCandidates');
+
+
+    fprintf('\n');
+    fprintf('============================================================\n');
+    fprintf('자동 공진 후보\n');
+    fprintf('============================================================\n');
+
+
+    for iCandidate = 1:height(resonanceCandidateTable)
+
+        fprintf([ ...
+            '후보 %d: %.0f rpm, %dX, %.3f Hz, ', ...
+            '가속도 증폭비 %.3f, 반력 증폭비 %.3f\n'], ...
+            iCandidate, ...
+            resonanceCandidateTable.TargetRPM(iCandidate), ...
+            resonanceCandidateTable.HarmonicOrder(iCandidate), ...
+            resonanceCandidateTable.CandidateFrequency_Hz(iCandidate), ...
+            resonanceCandidateTable.AccelerationAmplificationRatio( ...
+            iCandidate), ...
+            resonanceCandidateTable.ForceAmplificationRatio( ...
+            iCandidate));
+    end
+
+else
+
+    fprintf('\n');
+    fprintf('자동 공진 후보가 검출되지 않았습니다.\n');
+
+
+    if height(summaryTable) < 3
+
+        warning([ ...
+            '공진 후보 자동 판정에는 최소 3개의 RPM 시트가 ', ...
+            '필요합니다. 현재 유효 시트 수는 %d개입니다.'], ...
+            height(summaryTable));
+
+    else
+
+        warning([ ...
+            '설정된 증폭비 기준을 만족하는 공진 후보가 없습니다.']);
+    end
+end
+
+
+%% ========================================================================
+% 7. Figure 1
+% 모든 RPM의 시간응답을 한 Figure에 배치
+%% ========================================================================
+
+if createAllRPMTimeFigure
+
+    numberOfValidRPMs = numel(analysisResults);
+
+    figureHeight = max(900, 250 * numberOfValidRPMs);
+
+
+    figure1 = figure( ...
+        'Visible', figureVisibility, ...
+        'Color', 'w', ...
+        'Position', [40, 30, 1900, figureHeight]);
+
+
+    tiledlayout( ...
+        numberOfValidRPMs, ...
+        4, ...
+        'TileSpacing', 'compact', ...
+        'Padding', 'compact');
+
+
+    for iResult = 1:numberOfValidRPMs
+
+        currentResult = analysisResults(iResult);
+
+        revolutionAxis = ...
+            currentResult.RelativeRevolution;
+
+        rpmText = sprintf( ...
+            '%.0f rpm', ...
+            currentResult.TargetRPM);
+
+
+        % ----------------------------------------------------------------
+        % 전역 좌표계 가속도
+        % ----------------------------------------------------------------
+
+        nexttile;
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.AccelerationX_m_s2, ...
+            'LineWidth', 0.7);
+
+        hold on;
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.AccelerationY_m_s2, ...
+            'LineWidth', 0.7);
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.AccelerationXYMagnitude_m_s2, ...
+            'LineWidth', 0.9);
+
+        grid on;
+
+        xlabel('상대 회전 수 [rev]');
+        ylabel('가속도 [m/s^2]');
+
+        title(sprintf( ...
+            '%s | 전역 가속도', ...
+            rpmText));
+
+        if iResult == 1
+
+            legend( ...
+                'X', ...
+                'Y', ...
+                'XY 크기', ...
+                'Location', 'best');
+        end
+
+
+        % ----------------------------------------------------------------
+        % 회전체 좌표계 가속도
+        % ----------------------------------------------------------------
+
+        nexttile;
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.AccelerationRadial_m_s2, ...
+            'LineWidth', 0.7);
+
+        hold on;
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.AccelerationTangential_m_s2, ...
+            'LineWidth', 0.7);
+
+        grid on;
+
+        xlabel('상대 회전 수 [rev]');
+        ylabel('가속도 [m/s^2]');
+
+        title(sprintf( ...
+            '%s | 회전체 가속도', ...
+            rpmText));
+
+        if iResult == 1
+
+            legend( ...
+                'Radial', ...
+                'Tangential', ...
+                'Location', 'best');
+        end
+
+
+        % ----------------------------------------------------------------
+        % 합산반력 전역 성분
+        % ----------------------------------------------------------------
+
+        nexttile;
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.CombinedForceX_N, ...
+            'LineWidth', 0.7);
+
+        hold on;
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.CombinedForceY_N, ...
+            'LineWidth', 0.7);
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.CombinedForceZ_N, ...
+            'LineWidth', 0.7);
+
+        grid on;
+
+        xlabel('상대 회전 수 [rev]');
+        ylabel('합산반력 [N]');
+
+        title(sprintf( ...
+            '%s | 합산반력 전역', ...
+            rpmText));
+
+        if iResult == 1
+
+            legend( ...
+                'F_x', ...
+                'F_y', ...
+                'F_z', ...
+                'Location', 'best');
+        end
+
+
+        % ----------------------------------------------------------------
+        % 합산반력 회전체 좌표계
+        % ----------------------------------------------------------------
+
+        nexttile;
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.CombinedForceRadial_N, ...
+            'LineWidth', 0.7);
+
+        hold on;
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.CombinedForceTangential_N, ...
+            'LineWidth', 0.7);
+
+        plot( ...
+            revolutionAxis, ...
+            currentResult.CombinedForceAxial_N, ...
+            'LineWidth', 0.7);
+
+        grid on;
+
+        xlabel('상대 회전 수 [rev]');
+        ylabel('합산반력 [N]');
+
+        title(sprintf( ...
+            '%s | 합산반력 회전체', ...
+            rpmText));
+
+        if iResult == 1
+
+            legend( ...
+                'Radial', ...
+                'Tangential', ...
+                'Axial', ...
+                'Location', 'best');
+        end
+    end
+
+
+    sgtitle( ...
+        'Figure 1: 전체 RPM 시간응답 비교');
+
+
+    figure1File = fullfile( ...
+        figureFolder, ...
+        ['Figure1_AllRPM_TimeResponse_', ...
+        timeStamp, '.png']);
+
+
+    exportgraphics( ...
+        figure1, ...
+        figure1File, ...
+        'Resolution', 200);
+
+
+    if closeFiguresAfterSaving
+        close(figure1);
+    end
+end
+
+
+%% ========================================================================
+% 8. Figure 2
+% 모든 RPM FFT 중첩 비교
+%% ========================================================================
+
+if createFFTOverlayFigure
+
+    figure2 = figure( ...
+        'Visible', figureVisibility, ...
+        'Color', 'w', ...
+        'Position', [50, 40, 1900, 1000]);
+
+
+    tiledlayout(2, 2, ...
+        'TileSpacing', 'compact', ...
+        'Padding', 'compact');
+
+
+    minimumNyquistFrequency_Hz = ...
+        min([analysisResults.NyquistFrequency_Hz]);
+
+
+    displayMaximumFrequency_Hz = min( ...
+        maxPlotFrequency_Hz, ...
+        minimumNyquistFrequency_Hz);
+
+
+    % --------------------------------------------------------------------
+    % 전역 XY 가속도 합성 FFT
+    % --------------------------------------------------------------------
+
+    overlayAxes1 = nexttile;
+
+    hold on;
+
+
+    for iResult = 1:numel(analysisResults)
+
+        currentResult = analysisResults(iResult);
+
+        semilogy( ...
+            currentResult.Frequency_Hz, ...
+            max( ...
+            currentResult.AccelerationXYCombinedAmplitude_m_s2, ...
+            realmin), ...
+            'LineWidth', 1.0, ...
+            'DisplayName', sprintf( ...
+            '%.0f rpm', ...
+            currentResult.TargetRPM));
+    end
+
+
+    xlim([0, displayMaximumFrequency_Hz]);
+
+    grid on;
+
+    xlabel('주파수 [Hz]');
+    ylabel('가속도 진폭 [m/s^2]');
+
+    title('전역 XY 가속도 합성 FFT');
+
+    legend( ...
+        'Location', 'eastoutside');
+
+
+    % --------------------------------------------------------------------
+    % 회전체 radial/tangential 가속도 FFT
+    % --------------------------------------------------------------------
+
+    overlayAxes2 = nexttile;
+
+    hold on;
+
+
+    for iResult = 1:numel(analysisResults)
+
+        currentResult = analysisResults(iResult);
+
+
+        semilogy( ...
+            currentResult.Frequency_Hz, ...
+            max( ...
+            currentResult.AccelerationRadialAmplitude_m_s2, ...
+            realmin), ...
+            '-', ...
+            'LineWidth', 0.9, ...
+            'DisplayName', sprintf( ...
+            '%.0f rpm Radial', ...
+            currentResult.TargetRPM));
+
+
+        semilogy( ...
+            currentResult.Frequency_Hz, ...
+            max( ...
+            currentResult.AccelerationTangentialAmplitude_m_s2, ...
+            realmin), ...
+            '--', ...
+            'LineWidth', 0.9, ...
+            'DisplayName', sprintf( ...
+            '%.0f rpm Tangential', ...
+            currentResult.TargetRPM));
+    end
+
+
+    xlim([0, displayMaximumFrequency_Hz]);
+
+    grid on;
+
+    xlabel('주파수 [Hz]');
+    ylabel('가속도 진폭 [m/s^2]');
+
+    title('회전체 radial/tangential 가속도 FFT');
+
+    legend( ...
+        'Location', 'eastoutside');
+
+
+    % --------------------------------------------------------------------
+    % 전역 XY 합산반력 FFT
+    %
+    % Axial은 표시하지 않습니다.
+    % --------------------------------------------------------------------
+
+    overlayAxes3 = nexttile;
+
+    hold on;
+
+
+    for iResult = 1:numel(analysisResults)
+
+        currentResult = analysisResults(iResult);
+
+
+        semilogy( ...
+            currentResult.Frequency_Hz, ...
+            max( ...
+            currentResult.CombinedForceXYCombinedAmplitude_N, ...
+            realmin), ...
+            'LineWidth', 1.0, ...
+            'DisplayName', sprintf( ...
+            '%.0f rpm', ...
+            currentResult.TargetRPM));
+    end
+
+
+    xlim([0, displayMaximumFrequency_Hz]);
+
+    grid on;
+
+    xlabel('주파수 [Hz]');
+    ylabel('합산반력 진폭 [N]');
+
+    title('전역 XY 합산반력 FFT');
+
+    legend( ...
+        'Location', 'eastoutside');
+
+
+    % --------------------------------------------------------------------
+    % Radial/tangential 합산반력 FFT
+    %
+    % Axial은 표시하지 않습니다.
+    % --------------------------------------------------------------------
+
+    overlayAxes4 = nexttile;
+
+    hold on;
+
+
+    for iResult = 1:numel(analysisResults)
+
+        currentResult = analysisResults(iResult);
+
+
+        semilogy( ...
+            currentResult.Frequency_Hz, ...
+            max( ...
+            currentResult.CombinedForceRadialAmplitude_N, ...
+            realmin), ...
+            '-', ...
+            'LineWidth', 0.9, ...
+            'DisplayName', sprintf( ...
+            '%.0f rpm Radial', ...
+            currentResult.TargetRPM));
+
+
+        semilogy( ...
+            currentResult.Frequency_Hz, ...
+            max( ...
+            currentResult.CombinedForceTangentialAmplitude_N, ...
+            realmin), ...
+            '--', ...
+            'LineWidth', 0.9, ...
+            'DisplayName', sprintf( ...
+            '%.0f rpm Tangential', ...
+            currentResult.TargetRPM));
+    end
+
+
+    xlim([0, displayMaximumFrequency_Hz]);
+
+    grid on;
+
+    xlabel('주파수 [Hz]');
+    ylabel('합산반력 진폭 [N]');
+
+    title('Radial/tangential 합산반력 FFT');
+
+    legend( ...
+        'Location', 'eastoutside');
+
+
+    % --------------------------------------------------------------------
+    % 공진 후보 빨간 수직선
+    % --------------------------------------------------------------------
+
+    overlayAxes = [ ...
+        overlayAxes1, ...
+        overlayAxes2, ...
+        overlayAxes3, ...
+        overlayAxes4];
+
+
+    if ~isempty(resonanceCandidateTable)
+
+        for iCandidate = 1:height(resonanceCandidateTable)
+
+            candidateFrequency_Hz = ...
+                resonanceCandidateTable.CandidateFrequency_Hz( ...
+                iCandidate);
+
+
+            candidateRPM = ...
+                resonanceCandidateTable.TargetRPM(iCandidate);
+
+
+            candidateOrder = ...
+                resonanceCandidateTable.HarmonicOrder(iCandidate);
+
+
+            if candidateFrequency_Hz > displayMaximumFrequency_Hz
+                continue;
+            end
+
+
+            candidateLabel = sprintf( ...
+                '공진후보\n%.0f rpm, %dX\n%.1f Hz', ...
+                candidateRPM, ...
+                candidateOrder, ...
+                candidateFrequency_Hz);
+
+
+            for iAxes = 1:numel(overlayAxes)
+
+                if iAxes == 1
+
+                    xline( ...
+                        overlayAxes(iAxes), ...
+                        candidateFrequency_Hz, ...
+                        'r-', ...
+                        candidateLabel, ...
+                        'LineWidth', 2.2, ...
+                        'LabelVerticalAlignment', 'top', ...
+                        'LabelHorizontalAlignment', 'left', ...
+                        'HandleVisibility', 'off');
+
+                else
+
+                    xline( ...
+                        overlayAxes(iAxes), ...
+                        candidateFrequency_Hz, ...
+                        'r-', ...
+                        'LineWidth', 2.2, ...
+                        'HandleVisibility', 'off');
+                end
+            end
+        end
+    end
+
+
+    sgtitle( ...
+        'Figure 2: 전체 RPM FFT 중첩 비교');
+
+
+    figure2File = fullfile( ...
+        figureFolder, ...
+        ['Figure2_AllRPM_FFT_Overlay_', ...
+        timeStamp, '.png']);
+
+
+    exportgraphics( ...
+        figure2, ...
+        figure2File, ...
+        'Resolution', 200);
+
+
+    if closeFiguresAfterSaving
+        close(figure2);
+    end
+end
+
+
+%% ========================================================================
+% 9. Figure 3
+% RPM-주파수 Rainfall plot
+%% ========================================================================
+
+if createRainfallFigure
+
+    numberOfValidRPMs = numel(analysisResults);
+
+
+    if numberOfValidRPMs < 2
+
+        warning([ ...
+            'Rainfall plot을 생성하려면 최소 2개의 RPM 시트가 ', ...
+            '필요합니다. Figure 3을 생성하지 않습니다.']);
+
+    else
+
+        rpmVector = ...
+            [analysisResults.TargetRPM].';
+
+
+        minimumNyquistFrequency_Hz = ...
+            min([analysisResults.NyquistFrequency_Hz]);
+
+
+        rainfallMaximumFrequency_Hz = min( ...
+            maxPlotFrequency_Hz, ...
+            minimumNyquistFrequency_Hz);
+
+
+        commonFrequency_Hz = linspace( ...
+            0, ...
+            rainfallMaximumFrequency_Hz, ...
+            rainfallFrequencyPointCount);
+
+
+        accelerationXYRainfall = ...
+            zeros(numberOfValidRPMs, rainfallFrequencyPointCount);
+
+
+        accelerationRadialRainfall = ...
+            zeros(numberOfValidRPMs, rainfallFrequencyPointCount);
+
+
+        forceRadialRainfall = ...
+            zeros(numberOfValidRPMs, rainfallFrequencyPointCount);
+
+
+        forceTangentialRainfall = ...
+            zeros(numberOfValidRPMs, rainfallFrequencyPointCount);
+
+
+        for iResult = 1:numberOfValidRPMs
+
+            currentResult = analysisResults(iResult);
+
+
+            accelerationXYRainfall(iResult, :) = interp1( ...
+                currentResult.Frequency_Hz, ...
+                currentResult.AccelerationXYCombinedAmplitude_m_s2, ...
+                commonFrequency_Hz, ...
+                'linear', ...
+                0);
+
+
+            accelerationRadialRainfall(iResult, :) = interp1( ...
+                currentResult.Frequency_Hz, ...
+                currentResult.AccelerationRadialAmplitude_m_s2, ...
+                commonFrequency_Hz, ...
+                'linear', ...
+                0);
+
+
+            forceRadialRainfall(iResult, :) = interp1( ...
+                currentResult.Frequency_Hz, ...
+                currentResult.CombinedForceRadialAmplitude_N, ...
+                commonFrequency_Hz, ...
+                'linear', ...
+                0);
+
+
+            forceTangentialRainfall(iResult, :) = interp1( ...
+                currentResult.Frequency_Hz, ...
+                currentResult.CombinedForceTangentialAmplitude_N, ...
+                commonFrequency_Hz, ...
+                'linear', ...
+                0);
+        end
+
+
+        accelerationXYRainfall_dB = normalizeRainfallToDB( ...
+            accelerationXYRainfall, ...
+            rainfallDBFloor);
+
+
+        accelerationRadialRainfall_dB = normalizeRainfallToDB( ...
+            accelerationRadialRainfall, ...
+            rainfallDBFloor);
+
+
+        forceRadialRainfall_dB = normalizeRainfallToDB( ...
+            forceRadialRainfall, ...
+            rainfallDBFloor);
+
+
+        forceTangentialRainfall_dB = normalizeRainfallToDB( ...
+            forceTangentialRainfall, ...
+            rainfallDBFloor);
+
+
+        [frequencyGrid, rpmGrid] = meshgrid( ...
+            commonFrequency_Hz, ...
+            rpmVector);
+
+
+        figure3 = figure( ...
+            'Visible', figureVisibility, ...
+            'Color', 'w', ...
+            'Position', [60, 40, 1800, 1000]);
+
+
+        tiledlayout(2, 2, ...
+            'TileSpacing', 'compact', ...
+            'Padding', 'compact');
+
+
+        % ----------------------------------------------------------------
+        % 전역 XY 가속도 합성 Rainfall
+        % ----------------------------------------------------------------
+
+        rainfallAxes1 = nexttile;
+
+
+        surf( ...
+            rainfallAxes1, ...
+            frequencyGrid, ...
+            rpmGrid, ...
+            accelerationXYRainfall_dB, ...
+            'EdgeColor', 'none');
+
+
+        view(rainfallAxes1, 2);
+
+        set(rainfallAxes1, 'YDir', 'normal');
+
+        hold(rainfallAxes1, 'on');
+
+        grid(rainfallAxes1, 'on');
+
+        xlabel(rainfallAxes1, '주파수 [Hz]');
+        ylabel(rainfallAxes1, '회전속도 [rpm]');
+
+        title(rainfallAxes1, ...
+            '전역 XY 가속도 합성 Rainfall');
+
+        colorbar(rainfallAxes1);
+
+        caxis(rainfallAxes1, [rainfallDBFloor, 0]);
+
+
+        % ----------------------------------------------------------------
+        % Radial 가속도 Rainfall
+        % ----------------------------------------------------------------
+
+        rainfallAxes2 = nexttile;
+
+
+        surf( ...
+            rainfallAxes2, ...
+            frequencyGrid, ...
+            rpmGrid, ...
+            accelerationRadialRainfall_dB, ...
+            'EdgeColor', 'none');
+
+
+        view(rainfallAxes2, 2);
+
+        set(rainfallAxes2, 'YDir', 'normal');
+
+        hold(rainfallAxes2, 'on');
+
+        grid(rainfallAxes2, 'on');
+
+        xlabel(rainfallAxes2, '주파수 [Hz]');
+        ylabel(rainfallAxes2, '회전속도 [rpm]');
+
+        title(rainfallAxes2, ...
+            'Radial 가속도 Rainfall');
+
+        colorbar(rainfallAxes2);
+
+        caxis(rainfallAxes2, [rainfallDBFloor, 0]);
+
+
+        % ----------------------------------------------------------------
+        % Radial 합산반력 Rainfall
+        % ----------------------------------------------------------------
+
+        rainfallAxes3 = nexttile;
+
+
+        surf( ...
+            rainfallAxes3, ...
+            frequencyGrid, ...
+            rpmGrid, ...
+            forceRadialRainfall_dB, ...
+            'EdgeColor', 'none');
+
+
+        view(rainfallAxes3, 2);
+
+        set(rainfallAxes3, 'YDir', 'normal');
+
+        hold(rainfallAxes3, 'on');
+
+        grid(rainfallAxes3, 'on');
+
+        xlabel(rainfallAxes3, '주파수 [Hz]');
+        ylabel(rainfallAxes3, '회전속도 [rpm]');
+
+        title(rainfallAxes3, ...
+            'Radial 합산반력 Rainfall');
+
+        colorbar(rainfallAxes3);
+
+        caxis(rainfallAxes3, [rainfallDBFloor, 0]);
+
+
+        % ----------------------------------------------------------------
+        % Tangential 합산반력 Rainfall
+        % ----------------------------------------------------------------
+
+        rainfallAxes4 = nexttile;
+
+
+        surf( ...
+            rainfallAxes4, ...
+            frequencyGrid, ...
+            rpmGrid, ...
+            forceTangentialRainfall_dB, ...
+            'EdgeColor', 'none');
+
+
+        view(rainfallAxes4, 2);
+
+        set(rainfallAxes4, 'YDir', 'normal');
+
+        hold(rainfallAxes4, 'on');
+
+        grid(rainfallAxes4, 'on');
+
+        xlabel(rainfallAxes4, '주파수 [Hz]');
+        ylabel(rainfallAxes4, '회전속도 [rpm]');
+
+        title(rainfallAxes4, ...
+            'Tangential 합산반력 Rainfall');
+
+        colorbar(rainfallAxes4);
+
+        caxis(rainfallAxes4, [rainfallDBFloor, 0]);
+
+
+        rainfallAxes = [ ...
+            rainfallAxes1, ...
+            rainfallAxes2, ...
+            rainfallAxes3, ...
+            rainfallAxes4];
+
+
+        % ----------------------------------------------------------------
+        % 1X, 2X, 3X 차수선
+        % ----------------------------------------------------------------
+
+        for iAxes = 1:numel(rainfallAxes)
+
+            addOrderLinesToRainfall( ...
+                rainfallAxes(iAxes), ...
+                rpmVector, ...
+                harmonicOrders, ...
+                rainfallMaximumFrequency_Hz);
+        end
+
+
+        % ----------------------------------------------------------------
+        % 공진 후보 빨간 점
+        % ----------------------------------------------------------------
+
+        if ~isempty(resonanceCandidateTable)
+
+            for iCandidate = 1:height(resonanceCandidateTable)
+
+                candidateFrequency_Hz = ...
+                    resonanceCandidateTable.CandidateFrequency_Hz( ...
+                    iCandidate);
+
+
+                candidateRPM = ...
+                    resonanceCandidateTable.TargetRPM(iCandidate);
+
+
+                candidateOrder = ...
+                    resonanceCandidateTable.HarmonicOrder(iCandidate);
+
+
+                if candidateFrequency_Hz > ...
+                        rainfallMaximumFrequency_Hz
+
+                    continue;
+                end
+
+
+                for iAxes = 1:numel(rainfallAxes)
+
+                    plot( ...
+                        rainfallAxes(iAxes), ...
+                        candidateFrequency_Hz, ...
+                        candidateRPM, ...
+                        'ro', ...
+                        'MarkerSize', 9, ...
+                        'MarkerFaceColor', 'r', ...
+                        'LineWidth', 1.5, ...
+                        'HandleVisibility', 'off');
+                end
+
+
+                text( ...
+                    rainfallAxes1, ...
+                    candidateFrequency_Hz, ...
+                    candidateRPM, ...
+                    sprintf( ...
+                    '  %.0f rpm, %dX', ...
+                    candidateRPM, ...
+                    candidateOrder), ...
+                    'Color', 'r', ...
+                    'FontWeight', 'bold', ...
+                    'VerticalAlignment', 'bottom');
+            end
+        end
+
+
+        sgtitle( ...
+            sprintf( ...
+            'Figure 3: RPM-주파수 Rainfall, 정규화 진폭 [%d~0 dB]', ...
+            rainfallDBFloor));
+
+
+        figure3File = fullfile( ...
+            figureFolder, ...
+            ['Figure3_AllRPM_Rainfall_', ...
+            timeStamp, '.png']);
+
+
+        exportgraphics( ...
+            figure3, ...
+            figure3File, ...
+            'Resolution', 200);
+
+
+        if closeFiguresAfterSaving
+            close(figure3);
+        end
+    end
+end
+
+
+%% ========================================================================
+% 10. Figure 4
+% RPM별 고조파 진폭 추이
+%% ========================================================================
+
+if createHarmonicTrendFigure
+
+    figure4 = figure( ...
+        'Visible', figureVisibility, ...
+        'Color', 'w', ...
+        'Position', [100, 40, 1400, 1100]);
+
+
+    tiledlayout(3, 1, ...
+        'TileSpacing', 'compact', ...
+        'Padding', 'compact');
+
+
+    rpmAxis = summaryTable.TargetRPM;
+
+
+    % --------------------------------------------------------------------
+    % 가속도 고조파
+    % --------------------------------------------------------------------
+
+    harmonicAxes1 = nexttile;
+
+    hold on;
+
+
+    for iOrder = 1:numel(harmonicOrders)
+
+        currentOrder = harmonicOrders(iOrder);
+
+
+        variableName = sprintf( ...
+            'AccelerationXY_%dX_Amplitude_m_s2', ...
+            currentOrder);
+
+
+        plot( ...
+            rpmAxis, ...
+            summaryTable.(variableName), ...
+            '-o', ...
+            'LineWidth', 1.2, ...
+            'DisplayName', sprintf('%dX', currentOrder));
+    end
+
+
+    grid on;
+
+    xlabel('회전속도 [rpm]');
+    ylabel('가속도 진폭 [m/s^2]');
+
+    title('전역 XY 가속도 고조파');
+
+    legend('Location', 'best');
+
+
+    % --------------------------------------------------------------------
+    % Radial 합산반력 고조파
+    % --------------------------------------------------------------------
+
+    harmonicAxes2 = nexttile;
+
+    hold on;
+
+
+    for iOrder = 1:numel(harmonicOrders)
+
+        currentOrder = harmonicOrders(iOrder);
+
+
+        variableName = sprintf( ...
+            'CombinedRadialForce_%dX_Amplitude_N', ...
+            currentOrder);
+
+
+        plot( ...
+            rpmAxis, ...
+            summaryTable.(variableName), ...
+            '-o', ...
+            'LineWidth', 1.2, ...
+            'DisplayName', sprintf('%dX', currentOrder));
+    end
+
+
+    grid on;
+
+    xlabel('회전속도 [rpm]');
+    ylabel('합산반력 진폭 [N]');
+
+    title('Radial 합산반력 고조파');
+
+    legend('Location', 'best');
+
+
+    % --------------------------------------------------------------------
+    % Tangential 합산반력 고조파
+    % --------------------------------------------------------------------
+
+    harmonicAxes3 = nexttile;
+
+    hold on;
+
+
+    for iOrder = 1:numel(harmonicOrders)
+
+        currentOrder = harmonicOrders(iOrder);
+
+
+        variableName = sprintf( ...
+            'CombinedTangentialForce_%dX_Amplitude_N', ...
+            currentOrder);
+
+
+        plot( ...
+            rpmAxis, ...
+            summaryTable.(variableName), ...
+            '-o', ...
+            'LineWidth', 1.2, ...
+            'DisplayName', sprintf('%dX', currentOrder));
+    end
+
+
+    grid on;
+
+    xlabel('회전속도 [rpm]');
+    ylabel('합산반력 진폭 [N]');
+
+    title('Tangential 합산반력 고조파');
+
+    legend('Location', 'best');
+
+
+    % --------------------------------------------------------------------
+    % 공진 후보 빨간 점 표시
+    % --------------------------------------------------------------------
+
+    if ~isempty(resonanceCandidateTable)
+
+        for iCandidate = 1:height(resonanceCandidateTable)
+
+            candidateRPM = ...
+                resonanceCandidateTable.TargetRPM(iCandidate);
+
+
+            candidateOrder = ...
+                resonanceCandidateTable.HarmonicOrder(iCandidate);
+
+
+            summaryIndex = find( ...
+                summaryTable.TargetRPM == candidateRPM, ...
+                1, ...
+                'first');
+
+
+            if isempty(summaryIndex)
+                continue;
+            end
+
+
+            accelerationVariable = sprintf( ...
+                'AccelerationXY_%dX_Amplitude_m_s2', ...
+                candidateOrder);
+
+
+            radialVariable = sprintf( ...
+                'CombinedRadialForce_%dX_Amplitude_N', ...
+                candidateOrder);
+
+
+            tangentialVariable = sprintf( ...
+                'CombinedTangentialForce_%dX_Amplitude_N', ...
+                candidateOrder);
+
+
+            plot( ...
+                harmonicAxes1, ...
+                candidateRPM, ...
+                summaryTable.(accelerationVariable)(summaryIndex), ...
+                'ro', ...
+                'MarkerFaceColor', 'r', ...
+                'MarkerSize', 9, ...
+                'LineWidth', 1.5, ...
+                'HandleVisibility', 'off');
+
+
+            plot( ...
+                harmonicAxes2, ...
+                candidateRPM, ...
+                summaryTable.(radialVariable)(summaryIndex), ...
+                'ro', ...
+                'MarkerFaceColor', 'r', ...
+                'MarkerSize', 9, ...
+                'LineWidth', 1.5, ...
+                'HandleVisibility', 'off');
+
+
+            plot( ...
+                harmonicAxes3, ...
+                candidateRPM, ...
+                summaryTable.(tangentialVariable)(summaryIndex), ...
+                'ro', ...
+                'MarkerFaceColor', 'r', ...
+                'MarkerSize', 9, ...
+                'LineWidth', 1.5, ...
+                'HandleVisibility', 'off');
+
+
+            text( ...
+                harmonicAxes1, ...
+                candidateRPM, ...
+                summaryTable.(accelerationVariable)(summaryIndex), ...
+                sprintf( ...
+                '  공진후보 %dX', ...
+                candidateOrder), ...
+                'Color', 'r', ...
+                'FontWeight', 'bold', ...
+                'VerticalAlignment', 'bottom');
+        end
+    end
+
+
+    sgtitle( ...
+        'Figure 4: RPM별 회전 고조파 진폭 추이');
+
+
+    figure4File = fullfile( ...
+        figureFolder, ...
+        ['Figure4_HarmonicTrend_', ...
+        timeStamp, '.png']);
+
+
+    exportgraphics( ...
+        figure4, ...
+        figure4File, ...
+        'Resolution', 200);
+
+
+    if closeFiguresAfterSaving
+        close(figure4);
+    end
+end
+
+
+%% ========================================================================
+% 11. 분석 완료 메시지
+%% ========================================================================
+
+fprintf('\n');
+fprintf('============================================================\n');
+
+fprintf('전체 분석이 완료되었습니다.\n\n');
+
+fprintf('결과 Excel 파일\n');
+fprintf('%s\n\n', outputExcel);
+
+fprintf('그래프 저장 폴더\n');
+fprintf('%s\n\n', figureFolder);
+
+fprintf('생성되는 주요 Figure\n');
+fprintf('  Figure 1: 전체 RPM 시간응답\n');
+fprintf('  Figure 2: 전체 RPM FFT 중첩\n');
+fprintf('  Figure 3: RPM-주파수 Rainfall\n');
+fprintf('  Figure 4: RPM별 고조파 진폭\n');
+
+fprintf('============================================================\n');
+
+
+%% ========================================================================
+% 지역 함수
+%% ========================================================================
+
+function data = fillInvalidData(data, variableDescription)
+% NaN 및 Inf 값을 선형 보간합니다.
+
+    data = data(:);
+
+    data(~isfinite(data)) = NaN;
+
+
+    if all(isnan(data))
+
+        error( ...
+            '%s 데이터가 모두 NaN 또는 Inf입니다.', ...
+            variableDescription);
+    end
+
+
+    data = fillmissing( ...
+        data, ...
+        'linear', ...
+        'EndValues', 'nearest');
+end
+
+
+function outputSignal = interpolateSignal( ...
+    originalTime, ...
+    originalSignal, ...
+    newTime)
+% 원본 신호를 균일 시간축으로 선형 보간합니다.
+
+    outputSignal = interp1( ...
+        originalTime, ...
+        originalSignal, ...
+        newTime, ...
+        'linear');
+end
+
+
+function [frequency_Hz, amplitude, fftLength] = singleSidedFFT( ...
+    signal, ...
+    samplingFrequency_Hz, ...
+    useHannWindow, ...
+    useZeroPadding)
+% 단측 FFT peak 진폭 스펙트럼을 계산합니다.
+%
+% 처리 과정:
+%   1. 평균 및 선형 추세 제거
+%   2. Hann window 적용
+%   3. Coherent gain 보정
+%   4. 단측 peak 진폭 계산
+
+    signal = signal(:);
+
+    numberOfSamples = numel(signal);
+
+
+    if numberOfSamples < 4
+
+        error('FFT 계산을 위한 데이터 개수가 너무 적습니다.');
+    end
+
+
+    signal = detrend(signal, 'linear');
+
+
+    if useHannWindow
+
+        sampleIndex = (0:numberOfSamples-1).';
+
+
+        window = ...
+            0.5 - ...
+            0.5*cos( ...
+            2*pi*sampleIndex / numberOfSamples);
+
+    else
+
+        window = ones(numberOfSamples, 1);
+    end
+
+
+    windowedSignal = signal .* window;
+
+
+    if useZeroPadding
+
+        fftLength = ...
+            2^nextpow2(numberOfSamples);
+
+    else
+
+        fftLength = ...
+            numberOfSamples;
+    end
+
+
+    fftResult = fft( ...
+        windowedSignal, ...
+        fftLength);
+
+
+    numberOfSingleSidedPoints = ...
+        floor(fftLength / 2) + 1;
+
+
+    amplitude = ...
+        2 * ...
+        abs(fftResult(1:numberOfSingleSidedPoints)) / ...
+        sum(window);
+
+
+    amplitude(1) = amplitude(1) / 2;
+
+
+    if rem(fftLength, 2) == 0
+
+        amplitude(end) = amplitude(end) / 2;
+    end
+
+
+    frequency_Hz = ...
+        (0:numberOfSingleSidedPoints-1).' * ...
+        samplingFrequency_Hz / fftLength;
+end
+
+
+function [peakFrequency_Hz, peakAmplitude] = ...
+    findPeakNearFrequency( ...
+    frequency_Hz, ...
+    amplitude, ...
+    expectedFrequency_Hz, ...
+    searchHalfWidth_Hz)
+% 예상 회전 고조파 주파수 주변에서 최대 FFT 진폭을 검색합니다.
+
+    if ~isfinite(expectedFrequency_Hz) || ...
+            expectedFrequency_Hz < 0
+
+        peakFrequency_Hz = NaN;
+        peakAmplitude = NaN;
+
+        return;
+    end
+
+
+    searchMask = ...
+        frequency_Hz >= ...
+        max(0, expectedFrequency_Hz - searchHalfWidth_Hz) & ...
+        frequency_Hz <= ...
+        expectedFrequency_Hz + searchHalfWidth_Hz;
+
+
+    if ~any(searchMask)
+
+        peakFrequency_Hz = NaN;
+        peakAmplitude = NaN;
+
+        return;
+    end
+
+
+    searchFrequency_Hz = ...
+        frequency_Hz(searchMask);
+
+
+    searchAmplitude = ...
+        amplitude(searchMask);
+
+
+    [peakAmplitude, localPeakIndex] = ...
+        max(searchAmplitude);
+
+
+    peakFrequency_Hz = ...
+        searchFrequency_Hz(localPeakIndex);
+end
+
+
+function candidateTable = findResonanceCandidates( ...
+    summaryTable, ...
+    harmonicOrders, ...
+    minimumAccelerationAmplification, ...
+    minimumForceAmplification, ...
+    strongAccelerationAmplification)
+% RPM별 고조파 진폭의 국부 증폭을 이용하여 공진 후보를 검출합니다.
+%
+% 자동 판정에는 최소 3개 RPM이 필요합니다.
+%
+% 첫 번째 RPM과 마지막 RPM은 앞뒤 데이터가 모두 존재하지 않으므로
+% 자동 판정 대상에서 제외합니다.
+%
+% 공진 후보 조건:
+%
+% 조건 A:
+%   가속도 국부 증폭비 >= strongAccelerationAmplification
+%
+% 조건 B:
+%   가속도 국부 증폭비 >= minimumAccelerationAmplification
+%   전역 XY 합산반력 증폭비 >= minimumForceAmplification
+
+    numberOfRPMPoints = height(summaryTable);
+
+
+    if numberOfRPMPoints < 3
+
+        candidateTable = createEmptyCandidateTable();
+
+        return;
+    end
+
+
+    candidateSheet = strings(0, 1);
+    candidateRPM = zeros(0, 1);
+    candidateOrder = zeros(0, 1);
+    candidateFrequency = zeros(0, 1);
+
+    candidateAccelerationAmplitude = zeros(0, 1);
+    candidateForceAmplitude = zeros(0, 1);
+
+    candidateAccelerationRatio = zeros(0, 1);
+    candidateForceRatio = zeros(0, 1);
+
+    candidateReason = strings(0, 1);
+
+
+    rpmValues = summaryTable.TargetRPM;
+
+
+    for iOrder = 1:numel(harmonicOrders)
+
+        currentOrder = harmonicOrders(iOrder);
+
+
+        accelerationVariable = sprintf( ...
+            'AccelerationXY_%dX_Amplitude_m_s2', ...
+            currentOrder);
+
+
+        accelerationFrequencyVariable = sprintf( ...
+            'AccelerationXY_%dX_PeakFrequency_Hz', ...
+            currentOrder);
+
+
+        forceVariable = sprintf( ...
+            'CombinedGlobalXYForce_%dX_Amplitude_N', ...
+            currentOrder);
+
+
+        requiredVariables = { ...
+            accelerationVariable, ...
+            accelerationFrequencyVariable, ...
+            forceVariable};
+
+
+        if ~all(ismember( ...
+                requiredVariables, ...
+                summaryTable.Properties.VariableNames))
+
+            continue;
+        end
+
+
+        accelerationAmplitude = ...
+            summaryTable.(accelerationVariable);
+
+
+        accelerationPeakFrequency = ...
+            summaryTable.(accelerationFrequencyVariable);
+
+
+        forceAmplitude = ...
+            summaryTable.(forceVariable);
+
+
+        for iRPM = 2:numberOfRPMPoints-1
+
+            relevantValues = [ ...
+                accelerationAmplitude(iRPM-1:iRPM+1); ...
+                forceAmplitude(iRPM-1:iRPM+1)];
+
+
+            if any(~isfinite(relevantValues))
+                continue;
+            end
+
+
+            % 현재 RPM이 가속도 진폭의 국부 최대인지 확인합니다.
+
+            accelerationIsLocalMaximum = ...
+                accelerationAmplitude(iRPM) > ...
+                accelerationAmplitude(iRPM-1) && ...
+                accelerationAmplitude(iRPM) >= ...
+                accelerationAmplitude(iRPM+1);
+
+
+            if ~accelerationIsLocalMaximum
+                continue;
+            end
+
+
+            accelerationBaseline = ...
+                calculateNeighbourBaseline( ...
+                rpmValues, ...
+                accelerationAmplitude, ...
+                iRPM);
+
+
+            forceBaseline = ...
+                calculateNeighbourBaseline( ...
+                rpmValues, ...
+                forceAmplitude, ...
+                iRPM);
+
+
+            accelerationRatio = ...
+                accelerationAmplitude(iRPM) / ...
+                max(accelerationBaseline, eps);
+
+
+            forceRatio = ...
+                forceAmplitude(iRPM) / ...
+                max(forceBaseline, eps);
+
+
+            strongAccelerationCandidate = ...
+                accelerationRatio >= ...
+                strongAccelerationAmplification;
+
+
+            accelerationAndForceCandidate = ...
+                accelerationRatio >= ...
+                minimumAccelerationAmplification && ...
+                forceRatio >= ...
+                minimumForceAmplification;
+
+
+            if strongAccelerationCandidate
+
+                detectionReason = ...
+                    "가속도 강한 국부 증폭";
+
+            elseif accelerationAndForceCandidate
+
+                detectionReason = ...
+                    "가속도와 합산반력 동시 증폭";
+
+            else
+
+                continue;
+            end
+
+
+            candidateSheet(end+1, 1) = ...
+                string(summaryTable.Sheet(iRPM));
+
+
+            candidateRPM(end+1, 1) = ...
+                rpmValues(iRPM);
+
+
+            candidateOrder(end+1, 1) = ...
+                currentOrder;
+
+
+            candidateFrequency(end+1, 1) = ...
+                accelerationPeakFrequency(iRPM);
+
+
+            candidateAccelerationAmplitude(end+1, 1) = ...
+                accelerationAmplitude(iRPM);
+
+
+            candidateForceAmplitude(end+1, 1) = ...
+                forceAmplitude(iRPM);
+
+
+            candidateAccelerationRatio(end+1, 1) = ...
+                accelerationRatio;
+
+
+            candidateForceRatio(end+1, 1) = ...
+                forceRatio;
+
+
+            candidateReason(end+1, 1) = ...
+                detectionReason;
+        end
+    end
+
+
+    candidateTable = table( ...
+        candidateSheet, ...
+        candidateRPM, ...
+        candidateOrder, ...
+        candidateFrequency, ...
+        candidateAccelerationAmplitude, ...
+        candidateForceAmplitude, ...
+        candidateAccelerationRatio, ...
+        candidateForceRatio, ...
+        candidateReason, ...
+        'VariableNames', { ...
+        'Sheet', ...
+        'TargetRPM', ...
+        'HarmonicOrder', ...
+        'CandidateFrequency_Hz', ...
+        'AccelerationAmplitude_m_s2', ...
+        'GlobalXYForceAmplitude_N', ...
+        'AccelerationAmplificationRatio', ...
+        'ForceAmplificationRatio', ...
+        'DetectionReason'});
+
+
+    if ~isempty(candidateTable)
+
+        candidateTable = sortrows( ...
+            candidateTable, ...
+            {'TargetRPM', 'HarmonicOrder'});
+    end
+end
+
+
+function baselineValue = calculateNeighbourBaseline( ...
+    rpmValues, ...
+    amplitudeValues, ...
+    currentIndex)
+% 현재 RPM 앞뒤의 진폭값을 이용하여
+% 현재 RPM 위치의 선형 보간 기준값을 계산합니다.
+%
+% RPM 간격이 균일하지 않아도 적용할 수 있습니다.
+
+    rpmBefore = rpmValues(currentIndex - 1);
+    rpmCurrent = rpmValues(currentIndex);
+    rpmAfter = rpmValues(currentIndex + 1);
+
+
+    amplitudeBefore = amplitudeValues(currentIndex - 1);
+    amplitudeAfter = amplitudeValues(currentIndex + 1);
+
+
+    rpmInterval = rpmAfter - rpmBefore;
+
+
+    if ~isfinite(rpmInterval) || rpmInterval <= 0
+
+        baselineValue = ...
+            mean([amplitudeBefore, amplitudeAfter]);
+
+        baselineValue = max(baselineValue, eps);
+
+        return;
+    end
+
+
+    interpolationRatio = ...
+        (rpmCurrent - rpmBefore) / rpmInterval;
+
+
+    baselineValue = ...
+        amplitudeBefore + ...
+        interpolationRatio * ...
+        (amplitudeAfter - amplitudeBefore);
+
+
+    if ~isfinite(baselineValue) || baselineValue <= 0
+
+        baselineValue = ...
+            mean([amplitudeBefore, amplitudeAfter]);
+    end
+
+
+    baselineValue = max(baselineValue, eps);
+end
+
+
+function candidateTable = createEmptyCandidateTable()
+% 빈 공진 후보 테이블을 생성합니다.
+
+    candidateTable = table( ...
+        strings(0, 1), ...
+        zeros(0, 1), ...
+        zeros(0, 1), ...
+        zeros(0, 1), ...
+        zeros(0, 1), ...
+        zeros(0, 1), ...
+        zeros(0, 1), ...
+        zeros(0, 1), ...
+        strings(0, 1), ...
+        'VariableNames', { ...
+        'Sheet', ...
+        'TargetRPM', ...
+        'HarmonicOrder', ...
+        'CandidateFrequency_Hz', ...
+        'AccelerationAmplitude_m_s2', ...
+        'GlobalXYForceAmplitude_N', ...
+        'AccelerationAmplificationRatio', ...
+        'ForceAmplificationRatio', ...
+        'DetectionReason'});
+end
+
+
+function rainfallDB = normalizeRainfallToDB( ...
+    rainfallAmplitude, ...
+    dbFloor)
+% Rainfall 진폭을 각 subplot 전체의 최대값에 대해 정규화한
+% dB 값으로 변환합니다.
+%
+% 최대값:
+%   0 dB
+%
+% 최소 표시값:
+%   dbFloor
+
+    maximumAmplitude = ...
+        max(rainfallAmplitude(:));
+
+
+    if ~isfinite(maximumAmplitude) || maximumAmplitude <= 0
+
+        rainfallDB = ...
+            dbFloor * ones(size(rainfallAmplitude));
+
+        return;
+    end
+
+
+    normalizedAmplitude = ...
+        rainfallAmplitude / maximumAmplitude;
+
+
+    minimumLinearAmplitude = ...
+        10^(dbFloor / 20);
+
+
+    normalizedAmplitude = max( ...
+        normalizedAmplitude, ...
+        minimumLinearAmplitude);
+
+
+    rainfallDB = ...
+        20*log10(normalizedAmplitude);
+end
+
+
+function addOrderLinesToRainfall( ...
+    targetAxes, ...
+    rpmVector, ...
+    harmonicOrders, ...
+    maximumFrequency_Hz)
+% Rainfall plot에 1X, 2X, 3X 차수선을 표시합니다.
+%
+% 주파수:
+%   f_mX = m × RPM / 60
+
+    for iOrder = 1:numel(harmonicOrders)
+
+        currentOrder = harmonicOrders(iOrder);
+
+
+        orderFrequency_Hz = ...
+            currentOrder * rpmVector / 60;
+
+
+        validMask = ...
+            orderFrequency_Hz <= maximumFrequency_Hz;
+
+
+        if nnz(validMask) < 1
+            continue;
+        end
+
+
+        plot( ...
+            targetAxes, ...
+            orderFrequency_Hz(validMask), ...
+            rpmVector(validMask), ...
+            'w--', ...
+            'LineWidth', 1.3, ...
+            'HandleVisibility', 'off');
+
+
+        lastValidIndex = find( ...
+            validMask, ...
+            1, ...
+            'last');
+
+
+        text( ...
+            targetAxes, ...
+            orderFrequency_Hz(lastValidIndex), ...
+            rpmVector(lastValidIndex), ...
+            sprintf(' %dX', currentOrder), ...
+            'Color', 'w', ...
+            'FontWeight', 'bold', ...
+            'VerticalAlignment', 'bottom');
+    end
+end
+
+
+function sheetName = makeExcelSheetName(prefix, mainText)
+% Excel 시트명에서 사용할 수 없는 문자를 제거하고,
+% 최대 길이 31자 제한을 적용합니다.
+
+    sheetName = [char(prefix), char(mainText)];
+
+
+    invalidCharacters = { ...
+        '\', ...
+        '/', ...
+        '*', ...
+        '?', ...
+        ':', ...
+        '[', ...
+        ']'};
+
+
+    for iCharacter = 1:numel(invalidCharacters)
+
+        sheetName = strrep( ...
+            sheetName, ...
+            invalidCharacters{iCharacter}, ...
+            '_');
+    end
+
+
+    if length(sheetName) > 31
+
+        sheetName = sheetName(1:31);
+    end
+end
